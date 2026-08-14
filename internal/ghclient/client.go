@@ -1,16 +1,17 @@
 package ghclient
 
 import (
-	"context"
 	"fmt"
 	"net/http"
 )
 
+// Client wraps an http.Client with a concurrency limiter.
 type Client struct {
 	httpClient *http.Client
 	semaphore  chan struct{}
 }
 
+// NewClient creates a new Client with the specified concurrency limit.
 func NewClient(httpClient *http.Client, maxConcurrency int) *Client {
 	return &Client{
 		httpClient: httpClient,
@@ -18,12 +19,9 @@ func NewClient(httpClient *http.Client, maxConcurrency int) *Client {
 	}
 }
 
+// Do executes the HTTP request, respecting the concurrency limit.
 func (c *Client) Do(req *http.Request) (*http.Response, error) {
-	select {
-	case c.semaphore <- struct{}{}:
-	case <-req.Context().Done():
-		return nil, req.Context().Err()
-	}
+	c.semaphore <- struct{}{}
 	defer func() {
 		<-c.semaphore
 	}()
@@ -35,7 +33,7 @@ func (c *Client) Do(req *http.Request) (*http.Response, error) {
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		resp.Body.Close()
-		return nil, fmt.Errorf("unexpected status code: %d", resp.StatusCode)
+		return nil, fmt.Errorf("api error: %s", resp.Status)
 	}
 
 	return resp, nil
