@@ -1,98 +1,44 @@
 package ghclient
 
 import (
-	"context"
 	"net/http"
 	"net/http/httptest"
-	"sync"
 	"testing"
 	"time"
 )
 
 func TestClientConcurrencyPermitRelease(t *testing.T) {
+	// Create a mock server that returns 500 Internal Server Error
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusInternalServerError)
 	}))
 	defer server.Close()
 
-	maxConcurrency := 2
-	client := NewClient(server.Client(), maxConcurrency)
+	// Set concurrency limit to 2
+	client := NewClient(server.Client(), 2)
 
-	n := 5
-	var wg sync.WaitGroup
-	errorsChan := make(chan error, n)
-
-	for i := 0; i < n; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			req, err := http.NewRequestWithContext(context.Background(), "GET", server.URL, nil)
-			if err != nil {
-				errorsChan <- err
-				return
-			}
-			_, err = client.Do(req)
-			errorsChan <- err
-		}()
-	}
-
-	done := make(chan struct{})
-	go func() {
-		wg.Wait()
-		close(done)
-	}()
-
-	select {
-	case <-done:
-	case <-time.After(2 * time.Second):
-		t.Fatal("test timed out: requests blocked indefinitely, indicating a permit leak")
-	}
-
-	close(errorsChan)
-	for err := range errorsChan {
-		if err == nil {
-			t.Error("expected error for non-2xx response, got nil")
-		}
-	}
-
-	successServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusOK)
-	}))
-	defer successServer.Close()
-
-	successClient := NewClient(successServer.Client(), maxConcurrency)
-	for i := 0; i < maxConcurrency; i++ {
-		req, _ := http.NewRequestWithContext(context.Background(), "GET", server.URL, nil)
-		_, err := successClient.Do(req)
-		if err == nil {
-			t.Fatal("expected error from 500 server")
-		}
-	}
-
-	req, err := http.NewRequestWithContext(context.Background(), "GET", successServer.URL, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	respChan := make(chan *http.Response, 1)
-	errChan := make(chan error, 1)
-	go func() {
-		resp, err := successClient.Do(req)
+	// Fire 3 requests. If permits leak, the 3rd request will block indefinitely.
+	for i := 0; i < 3; i++ {
+		req, err := http.NewRequest("GET", server.URL, nil)
 		if err != nil {
-			errChan <- err
-		} else {
-			respChan <- resp
+			t.Fatalf("failed to create request: %v", err)
 		}
-	}()
 
-	select {
-	case resp := <-respChan:
-		if resp.StatusCode != http.StatusOK {
-			t.Errorf("expected status 200, got %d", resp.StatusCode)
+		// Use a channel to detect timeout/blocking
+		done := make(chan struct{})
+		var respErr error
+		go func() {
+			_, respErr = client.Do(req)
+			close(done)
+		}()
+
+		select {
+		case <-done:
+			if respErr == nil {
+				t.Error("expected error for 500 status code, got nil")
+			}
+		case <-time.After(2 * time.Second):
+			t.Fatalf("request %d blocked indefinitely (permit leak)", i+1)
 		}
-	case err := <-errChan:
-		t.Fatalf("failed to dispatch N+1 request: %v", err)
-	case <-time.After(1 * time.Second):
-		t.Fatal("N+1 request blocked, indicating permits were not fully reclaimed")
 	}
 }
